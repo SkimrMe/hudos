@@ -29,3 +29,5 @@
 . clang
 
 . llvm
+
+. lld
