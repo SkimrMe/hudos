@@ -24,6 +24,8 @@
 ## 需要软件
 . parted
 
+. mtools
+
 . qemu-system-arm
 
 . clang
