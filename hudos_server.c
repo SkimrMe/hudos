@@ -155,15 +155,39 @@ typedef struct {
 /* Print ASCII bytes to the console, mapping '\n' -> CRLF. */
 static void con_write_bytes(const char *buf, int n) {
     /* serial (best-effort, byte-oriented, '\n' -> CRLF) */
+    /* Bounds: buf may be attacker-controlled (e.g. a sys_fetch() reply reaching us
+     * through the fd 1/2 path), so every store is capacity-checked *before* it
+     * happens rather than relying on a flush test that happens to run afterwards.
+     * A '\n' costs two CHAR16 (CR+LF), so the newline case needs two free slots. */
     CHAR16 line[160];
+    enum { CON_LINE_CAP = 160, CON_LINE_FLUSH_AT = 150 };   /* leave room for the NUL */
     int i = 0;
     for (int k = 0; k < n; k++) {
         unsigned char ch = (unsigned char)buf[k];
-        if (ch == '\n') { line[i++] = (CHAR16)'\r'; line[i++] = (CHAR16)'\n'; }
+        if (ch == 0) break;
+        if (ch == '\n') {
+            if (i + 2 >= CON_LINE_CAP) {           /* flush, then retry this byte */
+                line[i] = 0;
+                if (gST && gST->ConOut) gST->ConOut->OutputString(gST->ConOut, line);
+                i = 0;
+            }
+            line[i++] = (CHAR16)'\r';
+            line[i++] = (CHAR16)'\n';
+        }
         else if (ch == '\r') { /* ignore */ }
-        else if (ch == 0) { break; }
-        else line[i++] = (CHAR16)ch;
-        if (i >= 150) { line[i] = 0; if (gST && gST->ConOut) gST->ConOut->OutputString(gST->ConOut, line); i = 0; }
+        else {
+            if (i + 1 >= CON_LINE_CAP) {           /* flush, then retry this byte */
+                line[i] = 0;
+                if (gST && gST->ConOut) gST->ConOut->OutputString(gST->ConOut, line);
+                i = 0;
+            }
+            line[i++] = (CHAR16)ch;
+        }
+        if (i >= CON_LINE_FLUSH_AT) {
+            line[i] = 0;
+            if (gST && gST->ConOut) gST->ConOut->OutputString(gST->ConOut, line);
+            i = 0;
+        }
     }
     if (i > 0) { line[i] = 0; if (gST && gST->ConOut) gST->ConOut->OutputString(gST->ConOut, line); }
     /* framebuffer console: decode UTF-8 -> codepoints -> kcon (no serial coupling).
@@ -1218,11 +1242,32 @@ typedef struct {
 #define DT_RELASZ 8
 #define DT_RELAENT 9
 
+/* Sanity ceiling for a userland image. A 512 MiB machine cannot host more than
+ * this anyway, and it stops a bogus p_memsz from asking AllocatePages for an
+ * absurd amount before we ever copy a byte. */
+#define ELF_MAX_IMAGE_BYTES  (256ULL * 1024 * 1024)
+#define ELF_PHENT_BYTES      56ULL            /* == sizeof(Elf64_Phdr) */
+
+/* Range check that cannot be defeated by 64-bit wraparound: returns 1 only if
+ * [off, off+len) lies inside [0, total). The subtraction form means an
+ * overflowing off+len can never masquerade as a valid range. */
+static int elf_range_ok(UINT64 off, UINT64 len, UINT64 total) {
+    if (off > total) return 0;
+    if (len > total - off) return 0;      /* off + len <= total, no overflow */
+    return 1;
+}
+
 /* Load an ELF from memory. Returns 0 on success and fills out_*.
- * Loads at an arbitrary page, applies RELATIVE/ABS64 relocations. */
+ * Loads at an arbitrary page, applies RELATIVE/ABS64 relocations.
+ *
+ * SECURITY: the image comes off the ESP and is therefore untrusted. Every
+ * offset/length taken from the file is range-checked before use and all size
+ * arithmetic is overflow-checked, so a crafted image cannot make us read past
+ * `data`, under-allocate the image (then overflow it while copying segments), or
+ * turn the relocation loop into an arbitrary kernel-memory write. */
 static int elf_load(const uint8_t *data, UINT64 size,
                     UINT64 *out_entry, UINT64 *out_base, UINT64 *out_pages, UINT64 *out_sp) {
-    if (size < sizeof(Elf64_Ehdr)) return -1;
+    if (!data || size < sizeof(Elf64_Ehdr)) return -1;
     const Elf64_Ehdr *eh = (const Elf64_Ehdr *)data;
     if (eh->e_ident[0] != 0x7f || eh->e_ident[1] != 'E' || eh->e_ident[2] != 'L' || eh->e_ident[3] != 'F') return -1;
     if (eh->e_ident[4] != 2) return -1;        /* ELFCLASS64 */
@@ -1230,17 +1275,32 @@ static int elf_load(const uint8_t *data, UINT64 size,
     if (eh->e_machine != EM_AARCH64) return -1;
     if (eh->e_type != ET_EXEC && eh->e_type != ET_DYN) return -1;
     if (eh->e_phnum == 0) return -1;
+    /* e_phentsize drives the program-header stride; for our fixed struct it must
+     * match exactly or the ph[] walk below would use the wrong spacing. */
+    if (eh->e_phentsize != ELF_PHENT_BYTES) return -1;
+    /* The whole program-header table must lie inside the file. Without this a
+     * large e_phnum walks ph[] straight off the end of `data`. */
+    if (!elf_range_ok(eh->e_phoff, (UINT64)eh->e_phnum * ELF_PHENT_BYTES, size)) return -1;
 
     /* size of loaded image */
     UINT64 maxaddr = 0;
     const Elf64_Phdr *ph = (const Elf64_Phdr *)(data + eh->e_phoff);
     for (UINT16 i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type == PT_LOAD) {
+            if (ph[i].p_memsz == 0) continue;   /* contributes nothing */
+            /* p_filesz must lie in the file and must not exceed p_memsz. */
+            if (!elf_range_ok(ph[i].p_offset, ph[i].p_filesz, size)) return -3;
+            if (ph[i].p_filesz > ph[i].p_memsz) return -3;
+            /* p_vaddr + p_memsz must not wrap: a wrapped sum would shrink
+             * maxaddr, we would under-allocate, and the segment copy below would
+             * then write past the end of the allocation. */
+            if (ph[i].p_vaddr > UINT64_MAX - ph[i].p_memsz) return -3;
             UINT64 end = ph[i].p_vaddr + ph[i].p_memsz;
             if (end > maxaddr) maxaddr = end;
         }
     }
     if (maxaddr == 0) return -1;
+    if (maxaddr > ELF_MAX_IMAGE_BYTES) return -1;    /* refuse absurd images */
 
     UINT64 img_pages  = (maxaddr + 0xFFF) / 4096;
     /* Userland stack: 16 KiB (4 pages) is far too small for media decoders such
@@ -1257,16 +1317,22 @@ static int elf_load(const uint8_t *data, UINT64 size,
 
     for (UINT16 i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type == PT_LOAD) {
-            if (ph[i].p_offset + ph[i].p_filesz > size) return -3;
+            if (ph[i].p_memsz == 0) continue;
+            /* Re-check now that the real image size is known: this is what
+             * actually bounds the destination write to the allocation. */
+            if (ph[i].p_vaddr > maxaddr - ph[i].p_memsz) return -3;
+            if (!elf_range_ok(ph[i].p_offset, ph[i].p_filesz, size)) return -3;
             gBS->CopyMem((VOID *)(UINTN)(base + ph[i].p_vaddr),
                          (VOID *)(UINTN)(data + ph[i].p_offset), ph[i].p_filesz);
         }
     }
 
     /* dynamic relocations */
-    UINT64 dt_rela = 0, dt_relasz = 0, dt_relaent = 24;
+    UINT64 dt_rela = 0, dt_relasz = 0, dt_relaent = sizeof(Elf64_Rela);
     for (UINT16 i = 0; i < eh->e_phnum; i++) {
         if (ph[i].p_type == PT_DYNAMIC) {
+            if (ph[i].p_filesz < 16) continue;
+            if (!elf_range_ok(ph[i].p_offset, ph[i].p_filesz, size)) return -3;
             const UINT64 *dyn = (const UINT64 *)(data + ph[i].p_offset);
             UINT64 n = ph[i].p_filesz / 16;
             for (UINT64 k = 0; k < n; k++) {
@@ -1278,6 +1344,13 @@ static int elf_load(const uint8_t *data, UINT64 size,
             }
         }
     }
+    /* DT_RELA / DT_RELASZ address the *loaded image*, not the file, so they are
+     * validated against maxaddr. A wrong relaent would make the stride below walk
+     * a bogus table, so distrust the whole thing if it does not match exactly. */
+    if (dt_relaent != sizeof(Elf64_Rela)) dt_relasz = 0;
+    if (dt_relasz > 0 && dt_rela > 0) {
+        if (!elf_range_ok(dt_rela, dt_relasz, maxaddr)) dt_relasz = 0;
+    }
     if (dt_relasz > 0 && dt_rela > 0) {
         const uint8_t *rela = (const uint8_t *)(UINTN)(base + dt_rela);
         UINT64 nrela = dt_relasz / dt_relaent;
@@ -1287,6 +1360,10 @@ static int elf_load(const uint8_t *data, UINT64 size,
             UINT64 r_info   = *(const UINT64 *)(e + 8);
             INT64  r_addend = *(const INT64  *)(e + 16);
             UINT32 type = (UINT32)(r_info & 0xffffffff);
+            /* An ABS64/RELATIVE write is 8 bytes wide, so the target must lie
+             * wholly inside the image. Without this, a crafted r_offset turns
+             * this loop into an arbitrary kernel-memory write primitive. */
+            if (!elf_range_ok(r_offset, sizeof(UINT64), maxaddr)) continue;
             if (type == R_AARCH64_RELATIVE) {
                 *(UINT64 *)(UINTN)(base + r_offset) = base + (UINT64)r_addend;
             } else if (type == R_AARCH64_ABS64) {
