@@ -20,4 +20,7 @@ Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
 
 ## 关于本项目
 
-**hodos** 是由双子星观测站开发的实验性操作系统内核项目。
+**hodos** 是由双子星观测站开发的实验性操作系统内核项目。 
+
+## 更新内容 
+1.内核进行了全面更新，更加完整。
