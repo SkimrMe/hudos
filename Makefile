@@ -1,35 +1,34 @@
-#  hudos-server — a minimal Unix-like OS / shell that runs as a UEFI
-#  application (aarch64 / ARM64 EFI). It boots from the ESP, presents a
-#  text CLI (ConOut, captured by QEMU -serial), implements ls/cd/mkdir/
-#  open/del/help/copy/pwd/cls, and can LOAD & RUN aarch64 ELF executables
-#  via the `open` command. Userland programs are freestanding PIE ELF files
-#  compiled for this platform; they talk to the OS through a tiny syscall
-#  shim passed in register x3 (no SVC / exceptions needed).
-# 
-#  Build with clang + lld-link (aarch64-pc-win32-coff), see Makefile.
-#  原主貌似没有提供Makefile文件, 所以以下是我自己写的
+# hudos-server build — aarch64 (ARM64) UEFI application
+# Toolchain: LLVM clang + lld-link (Homebrew), same as the hudos project.
 
-CC        := clang
-LD        := lld-link
+# 解决非up系统环境使用clang编译提示/opt路径下缺少编译器的问题
+# 去掉llvm绝对路径的参数
+CC       := clang
+LINK     := lld-link
+TARGET   := aarch64-pc-win32-coff
+
+CFLAGS := -target $(TARGET) -ffreestanding -fno-stack-protector -fshort-wchar \
+          -fno-builtin -Wall -O2 -I.
+
+BOOT := BOOTAA64.EFI
 
 .PHONY: all clean
-all: clean efi img
 
-efi: efi.h hudos_server.c
-	$(CC) -target aarch64-unknown-windows-gnu \
-	-ffreestanding \
-	-fshort-wchar \
-	-mno-red-zone \
-	-c hudos_server.c \
-	-o hudos_server.o
-	$(LD) -subsystem:efi_application \
-	-entry:efi_main \
-	-machine:arm64 \
-	hudos_server.o -out:BOOTAA64.EFI
-	@echo "output: hudos_server.o & BOOTAA64.EFI"
+all: $(BOOT) img
 
-elf:
-	$(MAKE) -C userland
+$(BOOT): hudos_server.c efi.h mmu.c mmu_asm.S tls.c tls_bn.c tls_rsa.c x509.c tls_cli.c tls_handshake.c tls.h tls_bn.h tls_rsa.h tls_cli.h tls_handshake.h tls_roots.h userland/cjk16x16.h
+	$(CC) $(CFLAGS) -c hudos_server.c -o hudos_server.o
+	$(CC) $(CFLAGS) -c mmu.c -o mmu.o
+	$(CC) $(CFLAGS) -c mmu_asm.S -o mmu_asm.o
+	$(CC) $(CFLAGS) -c tls.c -o tls.o
+	$(CC) $(CFLAGS) -c tls_bn.c -o tls_bn.o
+	$(CC) $(CFLAGS) -c tls_rsa.c -o tls_rsa.o
+	$(CC) $(CFLAGS) -c x509.c -o x509.o
+	$(CC) $(CFLAGS) -c tls_cli.c -o tls_cli.o
+	$(CC) $(CFLAGS) -c tls_handshake.c -o tls_handshake.o
+	$(LINK) /entry:efi_main /subsystem:EFI_APPLICATION /machine:arm64 \
+	        /dll /nodefaultlib /out:$(BOOT) hudos_server.o mmu.o mmu_asm.o \
+	        tls.o tls_bn.o tls_rsa.o x509.o tls_cli.o tls_handshake.o
 
 img: build_disk.sh
 	bash build_disk.sh
@@ -51,6 +50,7 @@ run-img:
 	-device usb-tablet,bus=xhci.0 \
 	-device usb-kbd,bus=xhci.0
 
+
 run-qcow2:
 	qemu-system-aarch64 \
 	-machine virt \
@@ -65,10 +65,7 @@ run-qcow2:
 	-device usb-tablet,bus=xhci.0 \
 	-device usb-kbd,bus=xhci.0
 
+
 clean:
-	rm -rf BOOT* \
-	*.o \
-	*.img \
-	*.qcow2 \
-	userland/*.o \
-	userland/*.elf
+	rm -f hudos_server.o mmu.o mmu_asm.o $(BOOT) *.lib \
+	rm -f *.o *.img *.qcow2 

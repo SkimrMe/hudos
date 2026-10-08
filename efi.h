@@ -305,6 +305,7 @@ struct _EFI_SIMPLE_TEXT_OUTPUT_PROTOCOL {
     VOID *QueryMode;
     VOID *SetMode;
     EFI_TEXT_CLEAR             ClearScreen;
+    VOID *SetAttribute;
     VOID *SetCursorPosition;
     VOID *EnableCursor;
     VOID *Mode;
@@ -327,6 +328,62 @@ struct _EFI_SIMPLE_TEXT_INPUT_PROTOCOL {
     EFI_INPUT_RESET      Reset;
     EFI_INPUT_READ_KEY   ReadKeyStroke;
     VOID                *WaitForKey;
+};
+
+/* ---- EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL (for querying modifier-key state) ----
+ * Standard SimpleTextInput (above) does NOT report bare modifier keys
+ * (Ctrl/Shift/Alt) — only composed keystrokes.  The Ex protocol's GetState()
+ * returns the live modifier shift-state, which we use to implement
+ * "Ctrl+click == right-click".  Field layout MUST match the UEFI spec. */
+typedef UINT8   EFI_KEY_TOGGLE_STATE;
+typedef UINT32  EFI_KEY_SHIFT_STATE;
+typedef struct {
+    EFI_KEY_TOGGLE_STATE KeyToggleState;
+    EFI_KEY_SHIFT_STATE  KeyShiftState;
+} EFI_KEY_STATE;
+
+/* Shift-state bits reported by GetState() (UEFI spec) */
+#define EFI_SHIFT_STATE_VALID          0x80000000
+#define EFI_RIGHT_SHIFT_PRESSED        0x00000001
+#define EFI_LEFT_SHIFT_PRESSED         0x00000002
+#define EFI_RIGHT_CONTROL_PRESSED      0x00000004
+#define EFI_LEFT_CONTROL_PRESSED       0x00000008
+#define EFI_RIGHT_ALT_PRESSED          0x00000010
+#define EFI_LEFT_ALT_PRESSED           0x00000020
+
+typedef struct {
+    EFI_INPUT_KEY      Key;
+    EFI_KEY_STATE      KeyState;
+} EFI_KEY_DATA;
+
+typedef struct _EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL;
+
+typedef EFI_STATUS (EFIAPI *EFI_INPUT_RESET_EX)(
+    IN EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This,
+    IN BOOLEAN ExtendedVerification);
+typedef EFI_STATUS (EFIAPI *EFI_INPUT_READ_KEY_EX)(
+    IN EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This,
+    OUT EFI_KEY_DATA *KeyData);
+typedef EFI_STATUS (EFIAPI *EFI_SET_STATE)(
+    IN EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This,
+    IN EFI_KEY_TOGGLE_STATE *KeyToggleState);
+typedef EFI_STATUS (EFIAPI *EFI_KEY_NOTIFY_FUNCTION)(
+    IN EFI_KEY_DATA *KeyData);
+typedef EFI_STATUS (EFIAPI *EFI_REGISTER_KEYSTROKE_NOTIFY)(
+    IN EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This,
+    IN EFI_KEY_DATA *KeyData,
+    IN EFI_KEY_NOTIFY_FUNCTION KeyNotificationFunction);
+typedef EFI_STATUS (EFIAPI *EFI_GET_STATE)(
+    IN EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL *This,
+    OUT EFI_KEY_STATE *KeyState);
+
+struct _EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL {
+    EFI_INPUT_RESET_EX                Reset;
+    EFI_INPUT_READ_KEY_EX             ReadKeyStrokeEx;
+    EFI_EVENT                         WaitForKeyEx;
+    EFI_SET_STATE                     SetState;
+    EFI_REGISTER_KEYSTROKE_NOTIFY     RegisterKeyNotify;
+    EFI_GET_STATE                     GetState;
 };
 
 /* UEFI scan codes for the arrow keys */
@@ -553,6 +610,8 @@ typedef struct {
     {0x09576e93,0x6d3f,0x11d2,{0x8E,0x39,0x00,0xA0,0xC9,0x69,0x72,0x3B}}
 #define EFI_GLOBAL_VARIABLE_GUID \
     {0x8BE4DF61,0x93CA,0x11d2,{0xAA,0x0D,0x00,0xE0,0x98,0x03,0x2B,0x8C}}
+#define EFI_SIMPLE_TEXT_INPUT_EX_PROTOCOL_GUID \
+    {0xdd9e7533,0x11d4,0x9a3a,{0x00,0x90,0x27,0x3f,0xc1,0x4d,0xda,0x0c}}
 
 /* helper: compare GUIDs */
 static inline INTN efi_guid_eq(const EFI_GUID *a, const EFI_GUID *b) {
